@@ -26,6 +26,9 @@ body {
   color: #fff;
 }
 .brand { color: #fff; text-decoration: none; font-weight: 600; }
+.topnav { display: flex; gap: 14px; }
+.topnav a { color: #c7d0dc; text-decoration: none; font-size: 14px; }
+.topnav a:hover { color: #fff; }
 .hint { color: #c7d0dc; font-size: 13px; }
 main { max-width: 1080px; margin: 24px auto 60px; padding: 0 20px; }
 .card {
@@ -122,3 +125,31 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: upp
 details summary { cursor: pointer; color: var(--accent); font-size: 13px; }
 details[open] summary { margin-bottom: 10px; }
 a { color: var(--accent); }
+select {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font: inherit;
+  background: #fff;
+  min-width: 160px;
+}
+.btn-secondary {
+  background: #eef1f4;
+  color: var(--ink);
+}
+.btn-secondary:hover { filter: brightness(0.97); }
+.comp-block {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 12px 0;
+  background: #fbfcfd;
+}
+.comp-block h3 {
+  font-size: 14px;
+  margin: 0 0 8px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.badge-failed { background: #fdecea; color: var(--bad); }

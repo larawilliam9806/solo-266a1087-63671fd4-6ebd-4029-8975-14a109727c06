@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}{{ station }} · {{ day }} 波形索引明细{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="spread">
+    <div>
+      <h1>台站 {{ station }} · {{ day }}（UTC）</h1>
+      <p class="muted">所有区间均为左闭右开整秒区间；同一文件编号各分量的起止时刻一致。</p>
+    </div>
+    <div class="actions">
+      <a class="button" href="{{ url_for('station_detail', station=station) }}">返回台站页</a>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>替换该日索引</h2>
+  <form method="post" enctype="multipart/form-data" class="row"
+        action="{{ url_for('upload_index', station=station, day=day) }}">
+    <label>索引 CSV
+      <input type="file" name="csv" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">上传 / 替换</button>
+  </form>
+  <p class="muted">替换时只重算该台站与换入/换出文件时段相交的清单窗口；仅含表头的 CSV 清空该日索引。</p>
+</section>
+
+<section class="card">
+  <h2>索引明细（{{ rows | length }} 个分量段）</h2>
+  {% if rows %}
+  <table>
+    <thead>
+      <tr><th>分量</th><th>文件编号</th><th>起始（UTC）</th><th>结束（UTC，不含）</th><th>时长（秒）</th></tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td><span class="badge">{{ row['component'] }}</span></td>
+        <td>{{ row['file_no'] }}</td>
+        <td>{{ row['start_ts'] | utc_ts }}</td>
+        <td>{{ row['end_ts'] | utc_ts }}</td>
+        <td>{{ row['end_ts'] - row['start_ts'] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">该日索引为空（已清空或从未上传）。</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}波形索引 · 台站{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>波形索引</h1>
+  <p class="muted">
+    按台站与 UTC 日上传或替换波形索引 CSV。每行记录分量（Z、N、E）、文件编号与 UTC 起止整秒；
+    文件从所选日开始、最长 24 小时、可跨午夜；文件编号在同一台站内唯一。仅含表头的 CSV 会清空该日索引。
+  </p>
+  <form method="post" action="{{ url_for('stations') }}" class="row">
+    <label>台站代码
+      <input type="text" name="station" required placeholder="例如 STA01" pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}">
+    </label>
+    <label>首个 UTC 日
+      <input type="date" name="day" required>
+    </label>
+    <button type="submit">新建台站 / 上传入口</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>已建台站（{{ stations | length }}）</h2>
+  {% if stations %}
+  <table>
+    <thead>
+      <tr><th>台站代码</th><th>已索引 UTC 日数</th><th>文件数（合计）</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for name in stations %}
+      {% set day_rows = summary[name] %}
+      <tr>
+        <td>{{ name }}</td>
+        <td>{{ day_rows | length }}</td>
+        <td>{{ day_rows | sum(attribute='file_count') }}</td>
+        <td><a href="{{ url_for('station_detail', station=name) }}">查看 / 上传</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">还没有台站索引。先在上方表单创建台站，再上传该台站某日的波形索引 CSV。</p>
+  {% endif %}
+</section>
+{% endblock %}

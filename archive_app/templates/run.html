@@ -71,6 +71,68 @@
 </section>
 
 <section class="card">
+  <h2>波形调阅清单</h2>
+  <p class="muted">
+    选择一个台站生成调阅清单：核对已查全日期内每个事件发震前 30 秒到发震后 90 秒（左闭右开）的三分量波形，
+    连续覆盖时按分量列出最少文件与各自截取范围（同分量截取段不重叠），覆盖不足时列出缺段。
+  </p>
+  <form method="post" action="{{ url_for('create_list', run_id=run['id']) }}" class="row">
+    <label>台站
+      {% if stations %}
+      <select name="station" required>
+        {% for name in stations %}
+        <option value="{{ name }}">{{ name }}</option>
+        {% endfor %}
+      </select>
+      {% else %}
+      <input type="text" name="station" required placeholder="尚无台站，请先上传波形索引"
+             pattern="[A-Za-z0-9][A-Za-z0-9._\-]{0,31}">
+      {% endif %}
+    </label>
+    <button type="submit">生成 / 重算调阅清单</button>
+    <a class="button btn-secondary" href="{{ url_for('stations') }}">管理波形索引</a>
+  </form>
+
+  {% if lists %}
+  <table style="margin-top:14px">
+    <thead>
+      <tr><th>清单 #</th><th>台站</th><th>状态</th><th>事件数</th><th>分量窗口</th><th>覆盖情况</th><th>更新时间</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for item in lists %}
+      <tr>
+        <td>#{{ item['id'] }}</td>
+        <td>{{ item['station'] }}</td>
+        <td>
+          {% if item['enabled'] == 1 %}
+          <span class="badge badge-complete">已启用</span>
+          {% else %}
+          <span class="badge">未启用</span>
+          {% endif %}
+        </td>
+        <td>{{ item['event_count'] }}</td>
+        <td>{{ item['window_rows'] }}</td>
+        <td>
+          {% if item['window_rows'] == 0 %}
+          <span class="muted">无窗口</span>
+          {% elif item['all_covered'] %}
+          <span style="color:var(--ok)">全部覆盖</span>
+          {% else %}
+          <span class="err">存在缺段</span>
+          {% endif %}
+        </td>
+        <td class="muted">{{ item['updated_at'] }}</td>
+        <td><a href="{{ url_for('list_detail', list_id=item['id']) }}">查看清单</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted" style="margin-top:10px">该任务尚未生成调阅清单。</p>
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>已采事件（{{ events | length }} 条）</h2>
   <details>
     <summary>展开查看编号、UTC 发震时刻与震级</summary>

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}{{ station }} · 波形索引{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="spread">
+    <div>
+      <h1>台站 {{ station }}</h1>
+      <p class="muted">
+        上传按该 UTC 日起始的索引 CSV（分量,文件编号,UTC 起始,UTC 结束）。
+        区间为左闭右开的整秒区间；仅表头的 CSV 用于清空该日索引。
+      </p>
+    </div>
+    <div class="actions">
+      <a class="button" href="{{ url_for('stations') }}">返回台站列表</a>
+    </div>
+  </div>
+
+  <h2>上传 / 替换某日索引</h2>
+  <form method="post" enctype="multipart/form-data" class="row"
+        action="{{ url_for('upload_index_form', station=station) }}">
+    <label>UTC 日
+      <input type="date" name="day" required>
+    </label>
+    <label>索引 CSV
+      <input type="file" name="csv" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">上传 / 替换</button>
+  </form>
+  {% if not exists %}
+  <p class="banner">该台站尚无任何索引；首次成功保存后才会出现在台站列表中。</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>已索引 UTC 日（{{ days | length }}）</h2>
+  {% if days %}
+  <table class="days">
+    <thead>
+      <tr><th>UTC 日期</th><th>分量段数</th><th>文件数</th><th>覆盖时间范围（UTC）</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for row in days %}
+      <tr>
+        <td>{{ row['day'] }}</td>
+        <td>{{ row['segment_count'] }}</td>
+        <td>{{ row['file_count'] }}</td>
+        <td class="muted">{{ row['min_ts'] | utc_ts }} ~ {{ row['max_ts'] | utc_ts }}</td>
+        <td><a href="{{ url_for('station_day', station=station, day=row['day']) }}">查看明细</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">尚无已保存的索引日。</p>
+  {% endif %}
+</section>
+{% endblock %}

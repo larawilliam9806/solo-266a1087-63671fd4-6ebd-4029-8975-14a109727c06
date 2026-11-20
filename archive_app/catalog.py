@@ -17,6 +17,9 @@ import threading
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
+from .planner import Segment, event_window, plan_event
+from .waveform import COMPONENTS, IndexRow, parse_wave_time
+
 
 PAGE_SIZE = 20
 MAX_SPAN_DAYS = 31
@@ -181,7 +184,55 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_events_day ON events(run_id, day);
+
+-- A waveform index belongs to a station and a UTC day.  Each row is one
+-- component interval of a physical file; (station, file_no) identifies a file.
+CREATE TABLE IF NOT EXISTS waveform_index (
+    station TEXT NOT NULL,
+    day TEXT NOT NULL,
+    component TEXT NOT NULL,
+    file_no TEXT NOT NULL,
+    start_ts INTEGER NOT NULL,
+    end_ts INTEGER NOT NULL,
+    PRIMARY KEY (station, day, file_no, component)
+);
+CREATE INDEX IF NOT EXISTS idx_wave_station_time
+    ON waveform_index(station, start_ts, end_ts);
+CREATE INDEX IF NOT EXISTS idx_wave_file ON waveform_index(station, file_no);
+
+-- One retrieval list per (run, station).  Enabled lists are kept in sync
+-- atomically whenever a day becomes complete or the station index changes.
+CREATE TABLE IF NOT EXISTS retrieval_lists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    station TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    UNIQUE (run_id, station),
+    FOREIGN KEY (run_id) REFERENCES runs(id) ON DELETE CASCADE
+);
+
+-- Saved planner output: one row per event/component, with the cut ranges and
+-- missing gaps stored as JSON arrays of [start_ts, end_ts] pairs.
+CREATE TABLE IF NOT EXISTS retrieval_windows (
+    list_id INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    origin_ts INTEGER NOT NULL,
+    window_start INTEGER NOT NULL,
+    window_end INTEGER NOT NULL,
+    component TEXT NOT NULL,
+    covered INTEGER NOT NULL,
+    cuts TEXT NOT NULL,
+    gaps TEXT NOT NULL,
+    PRIMARY KEY (list_id, event_id, component),
+    FOREIGN KEY (list_id) REFERENCES retrieval_lists(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_windows_list ON retrieval_windows(list_id, origin_ts, event_id);
 """
+
+LIST_DISABLED = 0
+LIST_ENABLED = 1
 
 STATUS_PENDING = "pending"
 STATUS_COMPLETE = "complete"   # day is fully archived
@@ -329,6 +380,9 @@ class Store:
                         except sqlite3.IntegrityError as exc:
                             raise ValueError(f"事件编号冲突: {e.event_id}") from exc
                     self._mark(conn, run_id, day, STATUS_COMPLETE)
+                # Enabled retrieval lists take effect together with the newly
+                # complete days, inside the same transaction.
+                self._sync_enabled_lists(conn, run_id, list(by_day))
             except Exception:
                 conn.rollback()
                 raise
@@ -404,6 +458,8 @@ class Store:
                 verify(existing)
             self._replace(conn, run_id, day, events, "csv")
             self._mark(conn, run_id, day, STATUS_COMPLETE)
+            # Backfilled day + enabled lists become effective together.
+            self._sync_enabled_lists(conn, run_id, [day])
             conn.commit()
 
     def is_ready(self, run_id: int) -> bool:
@@ -416,3 +472,337 @@ class Store:
                 "SELECT COUNT(*) FROM day_status WHERE run_id=?", (run_id,)
             ).fetchone()[0]
             return total > 0 and bad == 0
+
+    # ------------------------------------------------------------------
+    # Waveform index
+    # ------------------------------------------------------------------
+
+    def stations(self) -> list[str]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT station FROM waveform_index ORDER BY station"
+            ).fetchall()
+        return [r["station"] for r in rows]
+
+    def index_days(self, station: str) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT day, COUNT(*) AS segment_count, "
+                "COUNT(DISTINCT file_no) AS file_count, "
+                "MIN(start_ts) AS min_ts, MAX(end_ts) AS max_ts "
+                "FROM waveform_index WHERE station=? GROUP BY day ORDER BY day",
+                (station,),
+            ).fetchall()
+
+    def index_rows(self, station: str, day: str) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM waveform_index WHERE station=? AND day=? "
+                "ORDER BY file_no, component",
+                (station, day),
+            ).fetchall()
+
+    def station_index_segments(
+        self, conn: sqlite3.Connection, station: str
+    ) -> dict[str, list[Segment]]:
+        rows = conn.execute(
+            "SELECT component, file_no, start_ts, end_ts FROM waveform_index "
+            "WHERE station=? ORDER BY start_ts, file_no",
+            (station,),
+        ).fetchall()
+        grouped: dict[str, list[Segment]] = {c: [] for c in COMPONENTS}
+        for row in rows:
+            grouped.setdefault(row["component"], []).append(
+                Segment(row["file_no"], row["start_ts"], row["end_ts"])
+            )
+        return grouped
+
+    def replace_index(
+        self, station: str, day: str, rows: Sequence[IndexRow]
+    ) -> dict[str, int]:
+        """Replace one station-day index, recomputing only intersecting windows.
+
+        The whole operation (delete, insert, incremental list recomputation) is
+        transactional.  Validation against other days' files happens before any
+        write, so a failure leaves the prior index and every retrieval list
+        untouched.  Recomputation is limited to this station and to event
+        windows whose time range intersects a swapped-in or swapped-out file.
+        """
+        with self._lock, self.connect() as conn:
+            try:
+                old = conn.execute(
+                    "SELECT file_no, start_ts, end_ts FROM waveform_index "
+                    "WHERE station=? AND day=?",
+                    (station, day),
+                ).fetchall()
+                # File numbers are unique within a station: a number used on
+                # another day cannot be reused.
+                other_days = {
+                    r["file_no"]
+                    for r in conn.execute(
+                        "SELECT DISTINCT file_no FROM waveform_index "
+                        "WHERE station=? AND day!=?",
+                        (station, day),
+                    ).fetchall()
+                }
+                new_files = {r.file_no for r in rows}
+                conflicts = sorted(other_days & new_files)
+                if conflicts:
+                    raise ValueError(
+                        "文件编号已在该台站其他日期使用: " + ", ".join(conflicts)
+                    )
+
+                # Windows touching any old or new file interval need replanning.
+                bounds = [
+                    (r["start_ts"], r["end_ts"])
+                    for r in old
+                ] + [(r.start_ts, r.end_ts) for r in rows]
+                lo = min((b[0] for b in bounds), default=None)
+                hi = max((b[1] for b in bounds), default=None)
+
+                conn.execute(
+                    "DELETE FROM waveform_index WHERE station=? AND day=?",
+                    (station, day),
+                )
+                for row in rows:
+                    conn.execute(
+                        "INSERT INTO waveform_index"
+                        "(station, day, component, file_no, start_ts, end_ts) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (
+                            station,
+                            day,
+                            row.component,
+                            row.file_no,
+                            row.start_ts,
+                            row.end_ts,
+                        ),
+                    )
+
+                recomputed = 0
+                if lo is not None:
+                    recomputed = self._recompute_windows_span(conn, station, lo, hi)
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+        return {"rows": len(rows), "windows_recomputed": recomputed}
+
+    # ------------------------------------------------------------------
+    # Retrieval lists
+    # ------------------------------------------------------------------
+
+    def lists_for_run(self, run_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT l.*, "
+                "(SELECT COUNT(*) FROM retrieval_windows w WHERE w.list_id=l.id) AS window_rows, "
+                "(SELECT COUNT(DISTINCT w.event_id) FROM retrieval_windows w WHERE w.list_id=l.id) AS event_count, "
+                "(SELECT MIN(w.covered) FROM retrieval_windows w WHERE w.list_id=l.id) AS all_covered "
+                "FROM retrieval_lists l WHERE l.run_id=? ORDER BY l.station",
+                (run_id,),
+            ).fetchall()
+
+    def get_list(self, list_id: int) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT l.*, r.start_date AS run_start, r.end_date AS run_end "
+                "FROM retrieval_lists l JOIN runs r ON r.id=l.run_id "
+                "WHERE l.id=?",
+                (list_id,),
+            ).fetchone()
+
+    def list_windows(self, list_id: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM retrieval_windows WHERE list_id=? "
+                "ORDER BY origin_ts, event_id, component",
+                (list_id,),
+            ).fetchall()
+
+    def generate_retrieval_list(self, run_id: int, station: str) -> int:
+        """(Re)build the run/station list from completed-day events.
+
+        Replaces every saved window of the list in one transaction; progress,
+        index and prior list content survive if anything fails.
+        """
+        with self._lock, self.connect() as conn:
+            try:
+                if conn.execute(
+                    "SELECT 1 FROM runs WHERE id=?", (run_id,)
+                ).fetchone() is None:
+                    raise KeyError(run_id)
+                now = dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                conn.execute(
+                    "INSERT INTO retrieval_lists(run_id, station, enabled, updated_at) "
+                    "VALUES (?,?,0,?) "
+                    "ON CONFLICT(run_id, station) DO UPDATE SET updated_at=excluded.updated_at",
+                    (run_id, station, now),
+                )
+                list_id = conn.execute(
+                    "SELECT id FROM retrieval_lists WHERE run_id=? AND station=?",
+                    (run_id, station),
+                ).fetchone()["id"]
+                conn.execute(
+                    "DELETE FROM retrieval_windows WHERE list_id=?", (list_id,)
+                )
+                self._rebuild_windows(conn, list_id)
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+        return list_id
+
+    def set_list_enabled(self, list_id: int, enabled: bool) -> None:
+        """Enable/disable a list; enabling refreshes it inside one transaction."""
+        with self._lock, self.connect() as conn:
+            try:
+                row = conn.execute(
+                    "SELECT run_id FROM retrieval_lists WHERE id=?", (list_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(list_id)
+                now = dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+                conn.execute(
+                    "UPDATE retrieval_lists SET enabled=?, updated_at=? WHERE id=?",
+                    (LIST_ENABLED if enabled else LIST_DISABLED, now, list_id),
+                )
+                if enabled:
+                    conn.execute(
+                        "DELETE FROM retrieval_windows WHERE list_id=?", (list_id,)
+                    )
+                    self._rebuild_windows(conn, list_id)
+            except Exception:
+                conn.rollback()
+                raise
+            conn.commit()
+
+    # -- planner plumbing ----------------------------------------------
+
+    @staticmethod
+    def _completed_events(
+        conn: sqlite3.Connection, run_id: int, days: Sequence[str] | None = None
+    ) -> list[sqlite3.Row]:
+        sql = (
+            "SELECT e.event_id, e.utc_time FROM events e "
+            "JOIN day_status d ON d.run_id=e.run_id AND d.day=e.day "
+            "WHERE e.run_id=? AND d.status='complete'"
+        )
+        params: list = [run_id]
+        if days is not None:
+            if not days:
+                return []
+            sql += " AND e.day IN (%s)" % ",".join("?" for _ in days)
+            params.extend(days)
+        sql += " ORDER BY e.utc_time, e.event_id"
+        return conn.execute(sql, params).fetchall()
+
+    def _rebuild_windows(self, conn: sqlite3.Connection, list_id: int) -> int:
+        meta = conn.execute(
+            "SELECT run_id, station FROM retrieval_lists WHERE id=?", (list_id,)
+        ).fetchone()
+        if meta is None:
+            raise KeyError(list_id)
+        segments = self.station_index_segments(conn, meta["station"])
+        events = self._completed_events(conn, meta["run_id"])
+        return self._write_windows(conn, list_id, segments, events)
+
+    def _sync_enabled_lists(
+        self, conn: sqlite3.Connection, run_id: int, days: Sequence[str]
+    ) -> None:
+        """Replan newly completed-day events for every enabled list of the run.
+
+        Called inside the same transaction that marks the days complete, so an
+        event and its retrieval windows appear together.
+        """
+        lists = conn.execute(
+            "SELECT id, station FROM retrieval_lists WHERE run_id=? AND enabled=?",
+            (run_id, LIST_ENABLED),
+        ).fetchall()
+        if not lists:
+            return
+        events = self._completed_events(conn, run_id, list(days))
+        if not events:
+            return
+        for item in lists:
+            segments = self.station_index_segments(conn, item["station"])
+            event_ids = [e["event_id"] for e in events]
+            conn.execute(
+                "DELETE FROM retrieval_windows WHERE list_id=? AND event_id IN (%s)"
+                % ",".join("?" for _ in event_ids),
+                [item["id"], *event_ids],
+            )
+            self._write_windows(conn, item["id"], segments, events)
+
+    def _recompute_windows_span(
+        self, conn: sqlite3.Connection, station: str, lo: int, hi: int
+    ) -> int:
+        """Replan windows intersecting [lo, hi) for all lists of a station.
+
+        Used after an index replacement: only windows that touch a swapped-in or
+        swapped-out file interval are touched, and only lists of this station.
+        """
+        lists = conn.execute(
+            "SELECT id FROM retrieval_lists WHERE station=?", (station,)
+        ).fetchall()
+        if not lists:
+            return 0
+        segments = self.station_index_segments(conn, station)
+        count = 0
+        for item in lists:
+            affected = conn.execute(
+                "SELECT DISTINCT event_id, event_time AS utc_time, origin_ts "
+                "FROM retrieval_windows WHERE list_id=? "
+                "AND window_start < ? AND window_end > ?",
+                (item["id"], hi, lo),
+            ).fetchall()
+            if not affected:
+                continue
+            ids = [r["event_id"] for r in affected]
+            conn.execute(
+                "DELETE FROM retrieval_windows WHERE list_id=? AND event_id IN (%s)"
+                % ",".join("?" for _ in ids),
+                [item["id"], *ids],
+            )
+            count += self._write_windows(conn, item["id"], segments, list(affected))
+        return count
+
+    def _write_windows(
+        self,
+        conn: sqlite3.Connection,
+        list_id: int,
+        segments: dict[str, list[Segment]],
+        events: Iterable[sqlite3.Row],
+    ) -> int:
+        written = 0
+        for event in events:
+            origin_ts = parse_wave_time(event["utc_time"])
+            win_start, win_end = event_window(origin_ts)
+            plans = plan_event(origin_ts, segments)
+            for component in COMPONENTS:
+                plan = plans[component]
+                cuts = [
+                    {"file_no": c.file_no, "start_ts": c.start_ts, "end_ts": c.end_ts}
+                    for c in plan.cuts
+                ]
+                gaps = [[a, b] for a, b in plan.gaps]
+                conn.execute(
+                    "INSERT INTO retrieval_windows"
+                    "(list_id, event_id, event_time, origin_ts, window_start, "
+                    "window_end, component, covered, cuts, gaps) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        list_id,
+                        event["event_id"],
+                        event["utc_time"],
+                        origin_ts,
+                        win_start,
+                        win_end,
+                        component,
+                        1 if plan.covered else 0,
+                        json.dumps(cuts, separators=(",", ":")),
+                        json.dumps(gaps, separators=(",", ":")),
+                    ),
+                )
+                written += 1
+        return written

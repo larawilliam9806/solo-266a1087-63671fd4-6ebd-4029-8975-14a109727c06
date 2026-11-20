@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}调阅清单 #{{ header['id'] }} · {{ header['station'] }}{% endblock %}
+{% block content %}
+{% set enabled = header['enabled'] == 1 %}
+<section class="card">
+  <div class="spread">
+    <div>
+      <h1>调阅清单 #{{ header['id'] }} · 台站 {{ header['station'] }}</h1>
+      <p class="muted">
+        任务 #{{ header['run_id'] }}（{{ header['run_start'] }} ~ {{ header['run_end'] }} UTC）·
+        更新于 {{ header['updated_at'] }}
+      </p>
+    </div>
+    <div class="actions">
+      {% if enabled %}
+      <span class="badge badge-complete">已启用</span>
+      <form method="post" action="{{ url_for('disable_list', list_id=header['id']) }}">
+        <button type="submit" class="btn-secondary">停用</button>
+      </form>
+      {% else %}
+      <span class="badge">未启用</span>
+      <form method="post" action="{{ url_for('enable_list', list_id=header['id']) }}">
+        <button type="submit">启用清单</button>
+      </form>
+      {% endif %}
+      <a class="button" href="{{ url_for('run_detail', run_id=header['run_id']) }}">返回任务</a>
+    </div>
+  </div>
+
+  <p class="banner {% if all_covered %}ok{% endif %}">
+    核对已查全日期内每个事件发震前 30 秒至发震后 90 秒（左闭右开）的三分量波形。
+    共 {{ events | length }} 个事件、{{ window_rows }} 条分量窗口；
+    {% if all_covered %}所有分量均连续覆盖，可按下列最少文件调阅。{% else %}存在覆盖不足的分量，缺段已逐分量列出。{% endif %}
+  </p>
+  {% if enabled %}
+  <p class="muted">清单已启用：采集或补档使某日查全时，该日事件与本清单的调阅窗口会在同一事务中一起生效。</p>
+  {% else %}
+  <p class="muted">清单未启用：页面展示的是上次生成/重算时保存的内容，不会随采集自动更新。</p>
+  {% endif %}
+</section>
+
+{% for event in events %}
+<section class="card">
+  <h2>事件 {{ event['event_id'] }} · {{ event['event_time'] }} UTC</h2>
+  <p class="muted">
+    调阅窗口（左闭右开）：{{ event['window_start'] | utc_ts }} ~ {{ event['window_end'] | utc_ts }}
+  </p>
+  {% for comp in ['Z', 'N', 'E'] %}
+  {% set win = event['components'].get(comp) %}
+  <div class="comp-block">
+    <h3>
+      分量 {{ comp }}
+      {% if win and win['covered'] %}
+      <span class="badge badge-complete">连续覆盖 · {{ win['cuts'] | json_pairs | length }} 个文件</span>
+      {% else %}
+      <span class="badge badge-failed">覆盖不足 · 缺 {{ win['gaps'] | json_pairs | length }} 段</span>
+      {% endif %}
+    </h3>
+    {% if win and win['covered'] %}
+    <table>
+      <thead><tr><th>文件编号</th><th>截取起始（UTC，含）</th><th>截取结束（UTC，不含）</th><th>截取秒数</th></tr></thead>
+      <tbody>
+        {% for cut in win['cuts'] | json_pairs %}
+        <tr>
+          <td>{{ cut['file_no'] }}</td>
+          <td>{{ cut['start_ts'] | utc_ts }}</td>
+          <td>{{ cut['end_ts'] | utc_ts }}</td>
+          <td>{{ cut['end_ts'] - cut['start_ts'] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% elif win %}
+    <table>
+      <thead><tr><th>缺段起始（UTC，含）</th><th>缺段结束（UTC，不含）</th><th>缺失秒数</th></tr></thead>
+      <tbody>
+        {% for pair in win['gaps'] | json_pairs %}
+        <tr>
+          <td>{{ pair[0] | utc_ts }}</td>
+          <td>{{ pair[1] | utc_ts }}</td>
+          <td>{{ pair[1] - pair[0] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if win['cuts'] | json_pairs %}
+    <p class="muted">已覆盖片段：
+      {% for cut in win['cuts'] | json_pairs %}
+      文件 {{ cut['file_no'] }}（{{ cut['start_ts'] | utc_ts }} ~ {{ cut['end_ts'] | utc_ts }}）{% if not loop.last %}；{% endif %}
+      {% endfor %}
+    </p>
+    {% endif %}
+    {% else %}
+    <p class="err">缺少该分量窗口记录。</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</section>
+{% else %}
+<section class="card">
+  <p class="muted">清单中暂无事件窗口——可能任务还没有已查全日期的事件。采集或补档完成后重新生成/启用即可。</p>
+</section>
+{% endfor %}
+{% endblock %}
